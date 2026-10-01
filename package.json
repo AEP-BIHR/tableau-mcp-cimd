@@ -1,13 +1,13 @@
 {
-  "name": "@aep-bihr/tablea-mcp-cimd",
+  "name": "@tableau/mcp-server",
   "description": "Helping agents see and understand data.",
-  "version": "Bihr_v1.0.0",
+  "version": "4.16.4",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AEP-BIHR/tableau-mcp-cimd.git"
+    "url": "git+https://github.com/tableau/tableau-mcp.git"
   },
-  "homepage": "https://github.com/AEP-BIHR/tableau-mcp-cimd",
-  "bugs": "https://github.com/AEP-BIHR/tableau-mcp-cimd/issues",
+  "homepage": "https://github.com/tableau/tableau-mcp",
+  "bugs": "https://github.com/tableau/tableau-mcp/issues",
   "author": "Tableau",
   "type": "commonjs",
   "license": "Apache-2.0",
