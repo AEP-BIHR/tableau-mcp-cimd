@@ -14,19 +14,26 @@ jobs:
 
     steps:
       - name: Check out tagged source
-        uses: actions/checkout@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git init .
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git -c http.extraheader="AUTHORIZATION: bearer ${GITHUB_TOKEN}" fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: '22.x'
-          registry-url: https://registry.npmjs.org
-          cache: npm
+      - name: Check Node.js runtime
+        run: |
+          set -euo pipefail
+          node --version
+          npm --version
 
       - name: Set package version from tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           VERSION="${RELEASE_TAG#Bihr_v}"
           npm version "$VERSION" --no-git-tag-version
 
@@ -43,6 +50,8 @@ jobs:
         run: npx vitest run --config ./vitest.config.ts
 
       - name: Publish package
-        run: npm publish --tag bihr
+        run: |
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+          npm publish --tag bihr
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
