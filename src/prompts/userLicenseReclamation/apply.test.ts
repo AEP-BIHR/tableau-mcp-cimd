@@ -106,12 +106,34 @@ describe('user-license-reclamation-apply prompt', () => {
     expect(text).not.toContain('Missing users');
   });
 
-  it('narrows scope and adds Missing users section when userIds is provided', async () => {
+  it('targets requested IDs directly via an id:in: filter and gates Missing users on a non-truncated result', async () => {
     const text = await textOf({ userIds: 'aaaa-bbbb, cccc-dddd' });
     expect(text).toContain('`aaaa-bbbb`');
     expect(text).toContain('`cccc-dddd`');
-    expect(text).toContain('narrow the working set client-side');
+    // Requested IDs are targeted directly with an id:in: filter, not by fetching the whole site.
+    expect(text).toContain('id:in:aaaa-bbbb|cccc-dddd');
+    expect(text).not.toContain('retrieve all users on the site');
+    // A requested ID may only be declared "missing" after confirming the result was NOT truncated,
+    // so users beyond the default/hard cap are never falsely declared missing and silently skipped.
+    expect(text).toContain('mcp.resultInfo.truncated');
+    expect(text).toContain('NEVER skip a requested user based on a truncated inventory');
     expect(text).toContain('Missing users');
+  });
+
+  it('scopes the default (no-userIds) Step 1 with a role + lastLogin filter and requires a completeness check', async () => {
+    const text = await textOf();
+    // Direct scoping filter with an explicit limit — not an unbounded whole-site fetch.
+    expect(text).toContain('siteRole:in:');
+    expect(text).toContain(',lastLogin:lt:');
+    // Exactly 1000 (the list-users ceiling), not the 10000 used by the VDS queries.
+    expect(text).toMatch(/"limit": 1000(?!\d)/);
+    expect(text).not.toContain('retrieve all users on the site');
+    // Completeness gate so a truncated inventory is not mistaken for the full inactive set.
+    expect(text).toContain('Completeness check (required).');
+    expect(text).toContain('mcp.resultInfo.truncated');
+    // Narrowing does not always converge (never-signed-in users match every lastLogin:lt
+    // window) — the model must stop and report PARTIAL rather than loop indefinitely.
+    expect(text).toContain('STOP retrying');
   });
 
   it('de-duplicates repeated userIds', async () => {
@@ -152,6 +174,23 @@ describe('user-license-reclamation-apply prompt', () => {
     expect(text).not.toContain('"fieldCaption": "Actor User ID"');
     expect(text).not.toContain('"fieldCaption": "Event Created At"');
     expect(text).not.toContain('"Login"');
+  });
+
+  it('scopes the ts-events query (Step 2a) to the Step-1 candidate names to avoid the 10000-row truncation blind spot', async () => {
+    const text = await textOf();
+    // The ts-events query carries an `Actor User Name` SET filter with a replace-me placeholder.
+    expect(text).toContain(
+      '<REPLACE with the candidate Actor User Names from Step 1 — the Tableau username (equals the email on Tableau Cloud); one string per candidate>',
+    );
+    // The Step 2a instruction tells the model to scope, not to fetch site-wide events.
+    expect(text).toContain('**Scope this query to the Step-1 candidates.**');
+    expect(text).toContain('Do NOT fetch site-wide events.');
+  });
+
+  it('explains ts-events 0 rows (Step 2a) is valid but flags an unsubstituted placeholder', async () => {
+    const text = await textOf();
+    expect(text).toContain('0 rows in the TS Events result (2a) is a VALID outcome');
+    expect(text).toContain('fails to rescue genuinely-active users');
   });
 
   it('provides a deterministic VDS query for ts-users (Step 2b) with Desktop/Prep captions', async () => {

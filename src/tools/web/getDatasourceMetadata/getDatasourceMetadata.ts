@@ -6,6 +6,7 @@ import {
   ArgsValidationError,
   DatasourceNotAllowedError,
   FeatureDisabledError,
+  WorkbookDatasourceNotEnabledError,
 } from '../../../errors/mcpToolError.js';
 import { useRestApi } from '../../../restApiInstance.js';
 import { GraphQLResponse } from '../../../sdks/tableau/apis/metadataApi.js';
@@ -13,10 +14,15 @@ import { ProductVersion } from '../../../sdks/tableau/types/serverInfo.js';
 import { SiteRole } from '../../../sdks/tableau/types/user.js';
 import { WebMcpServer } from '../../../server.web.js';
 import { getResultForTableauVersion } from '../../../utils/isTableauVersionAtLeast.js';
+import { Provider } from '../../../utils/provider.js';
 import { getVizqlDataServiceDisabledError } from '../getVizqlDataServiceDisabledError.js';
 import { resourceAccessChecker } from '../resourceAccessChecker.js';
 import { ToolRules, WebTool } from '../tool.js';
-import { combineFields, simplifyReadMetadataResult } from './datasourceMetadataUtils.js';
+import {
+  combineFields,
+  FieldsResult,
+  simplifyReadMetadataResult,
+} from './datasourceMetadataUtils.js';
 
 export const getGraphqlQuery = (datasourceLuid: string): string => `
   query datasourceFieldInfo {
@@ -97,6 +103,20 @@ export type GetDatasourceMetadataError =
       message: string;
     };
 
+const getDatasourceMetadataToolDescription = `
+    This tool retrieves metadata for a specified datasource by taking the basic, high level, metadata results from Tableau's VizQL Data Service and enriches them with additional context provided by Tableau's Metadata API.
+    The metadata provided by this tool consists of the datasource model, fields, and parameters that belong to the datasource.
+    Fields will contain properties such as name and dataType, but may also expose richer context such as descriptions, dataCategories, roles, etc.
+    This tool should be used for getting the metadata to ground the use of a tool that queries Tableau published data sources.
+    `;
+
+const getDatasourceMetadataToolDescription20263 = `
+    This tool retrieves metadata for a datasource specified by its datasourceLuid, which may be a published or an embedded (workbook) data source. It takes the basic, high level, metadata results from Tableau's VizQL Data Service and enriches them with additional context provided by Tableau's Metadata API.
+    The metadata provided by this tool consists of the datasource model, fields, and parameters that belong to the datasource.
+    Fields will contain properties such as name and dataType. The richer Metadata API context (descriptions, dataCategories, roles, etc.) is only available for published data sources and may be absent for embedded ones.
+    This tool should be used for getting the metadata to ground the use of a tool that queries Tableau data sources.
+    `;
+
 export const getGetDatasourceMetadataTool = (
   server: WebMcpServer,
   productVersion: ProductVersion,
@@ -106,12 +126,15 @@ export const getGetDatasourceMetadataTool = (
     server,
     name: 'get-datasource-metadata',
     minRequiredRole: SiteRole.VIEWER,
-    description: `
-    This tool retrieves metadata for a specified datasource by taking the basic, high level, metadata results from Tableau's VizQL Data Service and enriches them with additional context provided by Tableau's Metadata API.
-    The metadata provided by this tool consists of the datasource model, fields, and parameters that belong to the datasource.
-    Fields will contain properties such as name and dataType, but may also expose richer context such as descriptions, dataCategories, roles, etc.
-    This tool should be used for getting the metadata to ground the use of a tool that queries Tableau published data sources.
-    `,
+    description: new Provider(() =>
+      getResultForTableauVersion({
+        productVersion,
+        mappings: {
+          '2026.3.0': getDatasourceMetadataToolDescription20263,
+          default: getDatasourceMetadataToolDescription,
+        },
+      }),
+    ),
     paramsSchema,
     annotations: {
       title: 'Get Datasource Metadata',
@@ -153,6 +176,11 @@ export const getGetDatasourceMetadataTool = (
               });
 
               if (readMetadataResult.isErr()) {
+                // Embedded (workbook) data sources are gated behind a per-site opt-in; surface the
+                // actionable gate error rather than the generic VizQL-disabled message.
+                if (readMetadataResult.error === 'workbook-datasource-not-enabled') {
+                  return new WorkbookDatasourceNotEnabledError().toErr();
+                }
                 return new FeatureDisabledError(getVizqlDataServiceDisabledError()).toErr();
               }
 
@@ -194,12 +222,35 @@ export const getGetDatasourceMetadataTool = (
                 );
               }
 
+              // Resolve published vs embedded. A publishedDatasources match is authoritative and
+              // free. On a miss, disambiguate an embedded (workbook) data source from a published
+              // one that isn't indexed by the Metadata API yet via the REST datasources endpoint,
+              // which only lists published data sources — so a not-found there means embedded.
+              let datasourceType: FieldsResult['datasourceType'] = listFieldsResult.data
+                .publishedDatasources?.[0]
+                ? 'published'
+                : undefined;
+              if (!datasourceType) {
+                const restLookup = await restApi.datasourcesMethods.tryQueryDatasource({
+                  siteId: restApi.siteId,
+                  datasourceId: datasourceLuid,
+                });
+                if (restLookup.isOk()) {
+                  datasourceType = 'published';
+                } else if (restLookup.error === 'not-found') {
+                  datasourceType = 'embedded';
+                }
+                // 'error' (permissions/transient) is non-authoritative; leave the type unset since
+                // labeling is best-effort and must never break the metadata response.
+              }
+
               // Combine the results from the VizQL Data Service API and the Tableau Metadata API.
               return Ok(
                 combineFields(
                   readMetadataResult.value,
                   listFieldsResult,
                   datasourceModelResult?.value,
+                  datasourceType,
                 ),
               );
             },

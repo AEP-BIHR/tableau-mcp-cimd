@@ -7,6 +7,9 @@ import {
 } from '../../errors/mcpToolError.js';
 import { RestApiArgs, useRestApi } from '../../restApiInstance.js';
 import { PULSE_PREMIUM_INSIGHTS_ENTITLEMENT } from '../../sdks/tableau/types/pulse.js';
+// Type-only: erased at compile time, so scopes.ts can import the value map below without a
+// runtime import cycle.
+import type { TableauApiScope } from '../../server/oauth/scopes.js';
 import { retry } from '../../utils/retry.js';
 
 /**
@@ -16,9 +19,26 @@ import { retry } from '../../utils/retry.js';
  * then add or update the `registrationConditions` property for all the tools the condition should apply to.
  */
 export type RegistrationCondition =
+  | 'RequiresKnowledge'
   | 'RequiresPulse'
   | 'RequiresPulsePremium'
   | 'MissingConditionCheck';
+
+/**
+ * Map of registration conditions to the JWT scopes needed for checking said condition.
+ *
+ * Each tool that requires registration conditions must also add the associated scopes to the
+ * `toolScopeMap` in scopes.ts
+ */
+export const REGISTRATION_CONDITION_API_SCOPES: Record<
+  RegistrationCondition,
+  ReadonlyArray<TableauApiScope>
+> = {
+  RequiresKnowledge: ['tableau:knowledge:read'],
+  RequiresPulse: ['tableau:insight_definitions_metrics:read'],
+  RequiresPulsePremium: ['tableau:entitlements:read'],
+  MissingConditionCheck: [],
+};
 
 /**
  * Context to be populated during tool registration. Useful for storing
@@ -26,6 +46,7 @@ export type RegistrationCondition =
  */
 export type RegistrationContext = {
   siteRole?: string;
+  isKnowledgeAvailable?: boolean;
   isPulseEnabled?: boolean;
   hasPulsePremium?: boolean;
 };
@@ -56,6 +77,15 @@ export async function checkRegistrationConditions(
 ): Promise<ConditionsCheckResult> {
   for (const condition of conditions) {
     switch (condition) {
+      case 'RequiresKnowledge': {
+        if (context.isKnowledgeAvailable === undefined) {
+          context.isKnowledgeAvailable = await checkKnowledgeAvailable(restApiArgs);
+        }
+        if (!context.isKnowledgeAvailable) {
+          return { registrationConditionsMet: false, failingCondition: 'RequiresKnowledge' };
+        }
+        continue;
+      }
       case 'RequiresPulse': {
         if (context.isPulseEnabled === undefined) {
           context.isPulseEnabled = await checkPulseEnabled(restApiArgs);
@@ -75,8 +105,9 @@ export async function checkRegistrationConditions(
         continue;
       }
       /**
-       * Adding a new registration condition - Step 2: Add a case for checking new condition above,
-       * and populate the `context` object to prevent the same condition from being rechecked with each pass.
+       * Adding a new registration condition - Step 2: Add a case for checking new condition above.
+       * Update `REGISTRATION_CONDITION_API_SCOPES` with any JWT scopes required for checking the new condition.
+       * After checking a condition, populate the `context` object to prevent the same condition from being rechecked with each pass.
        * See `getCurrentUserSiteRole` or above functions for examples on checking conditions.
        */
       default: {
@@ -104,6 +135,10 @@ export async function checkRegistrationConditions(
  * that some tools were omitted due to an unmet registration condition.
  */
 const UNMET_CONDITION_INSTRUCTIONS: Record<RegistrationCondition, string> = {
+  RequiresKnowledge:
+    'NOTE: Tableau Knowledge tools were omitted because availability could not be confirmed for ' +
+    'this session. If the user asks for Knowledge context, explain that the feature requires ' +
+    'Tableau+ and suggest they contact their Tableau administrator.',
   // Kept generic: Pulse can be unavailable for several reasons (Tableau Server, site setting
   // off, or a user-level preference), and the probe cannot distinguish them cleanly enough to
   // name a single cause here.
@@ -131,6 +166,29 @@ export function getUnmetConditionInstructions(condition: RegistrationCondition):
 
 /** Number of retries for API calls for a condition check (1 initial attempt + {@link MAX_API_RETRY_ATTEMPTS} retries = 3 total attempts). */
 export const MAX_API_RETRY_ATTEMPTS = 2;
+
+/** `listGraphs` is available to every Knowledge read role and succeeds for an entitled empty site. */
+async function checkKnowledgeAvailable(restApiArgs: RestApiArgs): Promise<boolean> {
+  try {
+    return await retry(
+      () =>
+        useRestApi({
+          ...restApiArgs,
+          jwtScopes: REGISTRATION_CONDITION_API_SCOPES.RequiresKnowledge,
+          callback: async (restApi) => {
+            await restApi.knowledgeMethods.listGraphs();
+            return true;
+          },
+        }),
+      {
+        maxRetries: MAX_API_RETRY_ATTEMPTS,
+        retryIf: isRetryableProbeError,
+      },
+    );
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Whether a failed capability probe is worth retrying.
@@ -172,7 +230,7 @@ async function checkPulseEnabled(restApiArgs: RestApiArgs): Promise<boolean> {
       () =>
         useRestApi({
           ...restApiArgs,
-          jwtScopes: ['tableau:insight_definitions_metrics:read'],
+          jwtScopes: REGISTRATION_CONDITION_API_SCOPES.RequiresPulse,
           callback: async (restApi) => {
             const result = await restApi.pulseMethods.listAllPulseMetricDefinitions(
               undefined,
@@ -242,7 +300,7 @@ async function checkPulsePremium(
       () =>
         useRestApi({
           ...restApiArgs,
-          jwtScopes: ['tableau:entitlements:read'],
+          jwtScopes: REGISTRATION_CONDITION_API_SCOPES.RequiresPulsePremium,
           callback: async (restApi) => {
             const result = await restApi.pulseMethods.getPulseEntitlements();
 

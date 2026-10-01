@@ -55,6 +55,14 @@ export default [
     },
   },
   {
+    // Custom-provider test fixtures loaded via require(): plain JS, so the
+    // TS return-type rule is inapplicable.
+    files: ['src/sessionStore/__fixtures__/**/*.cjs'],
+    rules: {
+      '@typescript-eslint/explicit-function-return-type': 'off',
+    },
+  },
+  {
     languageOptions: {
       ecmaVersion: 'latest',
       sourceType: 'module',
@@ -71,6 +79,7 @@ export default [
       'docs/build/**',
       '.claude/**',
       '.worktrees/**',
+      'src/templates/**',
     ],
   },
   {
