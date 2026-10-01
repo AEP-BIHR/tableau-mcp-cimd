@@ -10,14 +10,27 @@ import {
   QueryPermissionsOutput,
   QueryRequest,
   ReadMetadataRequest,
+  TableauError,
   UserHasQueryPermissionsRequest,
   vizqlDataServiceApis,
 } from '../apis/vizqlDataServiceApi.js';
 import { RestApiCredentials } from '../restApi.js';
 import AuthenticatedMethods from './authenticatedMethods.js';
 
+// The `VDSForWorkbookDatasources` gate: a site-scoped opt-in flag required to query embedded
+// (workbook) datasources. Enforced by headless-bi's interceptor as HTTP 403 / errorCode 403800 on
+// every VDS endpoint; we match the flag name in the message (403800 alone is a generic denial).
+export const WORKBOOK_DS_NOT_ENABLED_FLAG = 'VDSForWorkbookDatasources';
+
+export function isWorkbookDatasourceNotEnabled(error: TableauError | undefined): boolean {
+  return (
+    error?.message?.toLowerCase().includes(WORKBOOK_DS_NOT_ENABLED_FLAG.toLowerCase()) ?? false
+  );
+}
+
 export type VdsQueryError =
   | { type: 'feature-disabled' }
+  | { type: 'workbook-datasource-not-enabled' }
   | { type: 'api-error'; message: string; httpStatus: number; errorCode: string | undefined }
   | { type: 'zodios-error'; error: ZodiosError };
 
@@ -51,6 +64,11 @@ export default class VizqlDataServiceMethods extends AuthenticatedMethods<
       return Ok(await this._apiClient.queryDatasource(queryRequest, { ...this.authHeader }));
     } catch (error) {
       if (isErrorFromAlias(this._apiClient.api, 'queryDatasource', error)) {
+        // Detection keys off the message, not the status (see predicate), so this runs before the
+        // 404 branch to keep the gate from being mislabeled as VizQL-disabled.
+        if (isWorkbookDatasourceNotEnabled(error.response.data)) {
+          return Err({ type: 'workbook-datasource-not-enabled' });
+        }
         if (error.response.status === 404) {
           return Err({ type: 'feature-disabled' });
         }
@@ -80,15 +98,19 @@ export default class VizqlDataServiceMethods extends AuthenticatedMethods<
    */
   readMetadata = async (
     readMetadataRequest: ReadMetadataRequest,
-  ): Promise<Result<MetadataResponse, 'feature-disabled'>> => {
+  ): Promise<Result<MetadataResponse, 'feature-disabled' | 'workbook-datasource-not-enabled'>> => {
     try {
       return Ok(await this._apiClient.readMetadata(readMetadataRequest, { ...this.authHeader }));
     } catch (error) {
-      if (
-        isErrorFromAlias(this._apiClient.api, 'readMetadata', error) &&
-        error.response.status === 404
-      ) {
-        return Err('feature-disabled');
+      if (isErrorFromAlias(this._apiClient.api, 'readMetadata', error)) {
+        // Detection keys off the message, not the status (see predicate), so this runs before the
+        // 404 branch to keep the gate from being mislabeled as VizQL-disabled.
+        if (isWorkbookDatasourceNotEnabled(error.response.data)) {
+          return Err('workbook-datasource-not-enabled');
+        }
+        if (error.response.status === 404) {
+          return Err('feature-disabled');
+        }
       }
 
       throw error;
@@ -143,18 +165,20 @@ export default class VizqlDataServiceMethods extends AuthenticatedMethods<
         const errorCode = error.response.data?.errorCode;
         const message = error.response.data?.message;
 
-        // feature-disabled is reserved for *systemic* failures that apply to every data source,
-        // not just the one requested:
-        //  - 404950: the endpoint is absent on an older server.
-        //  - a 403 whose message says the feature "is not enabled": VDS is switched off site-wide.
-        //    (errorCode 403800 is overloaded — it also signals a per-data-source denial — so the
-        //    message is the only reliable discriminator.)
+        // Two *systemic* failures that apply to every data source, kept distinct because the caller
+        // maps them to different isQueryable verdicts (see enrichUpstreamDatasourceQueryability):
+        //  - workbook-datasource-not-enabled: the endpoint answered but the VDSForWorkbookDatasources
+        //    feature is off site-wide, so querying is disabled. (errorCode 403800 is overloaded — it
+        //    also signals a per-data-source denial — so the flag name in the message is the only
+        //    reliable discriminator.)
+        //  - feature-disabled: errorCode 404950, the endpoint itself is absent on an older server, so
+        //    it can't answer at all.
         // Everything else (per-data-source denials, not-found data sources, auth failures,
         // transient errors) is surfaced as api-error for the caller to interpret per data source.
-        if (
-          errorCode === '404950' ||
-          (status === 403 && (message ?? '').toLowerCase().includes('not enabled'))
-        ) {
+        if (isWorkbookDatasourceNotEnabled(error.response.data)) {
+          return Err({ type: 'workbook-datasource-not-enabled' });
+        }
+        if (errorCode === '404950') {
           return Err({ type: 'feature-disabled' });
         }
 
